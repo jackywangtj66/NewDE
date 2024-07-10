@@ -1,0 +1,248 @@
+# -*- coding: utf-8 -*-
+# ---
+# jupyter:
+#   jupytext:
+#     text_representation:
+#       extension: .ipy
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.6.0
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
+
+#%% imports
+import numpy as np
+import pandas as pd
+from os import path
+from math import ceil
+from scanpy import read_h5ad
+# from matplotlib import pyplot as plt
+from tensorflow_probability import math as tm
+tfk = tm.psd_kernels
+
+from models import cf,sf,sfh
+from utils import preprocess,misc,training,visualize,postprocess
+
+dtp = "float32"
+pth = "scrna/sshippo"
+dpth = path.join(pth,"data")
+mpth = path.join(pth,"models/V5")
+#mpth = "/Volumes/Princeton_research_files/spatial-tx/scrna/sshippo/models/V5"
+rpth = path.join(pth,"results")
+plt_pth = path.join(rpth,"plots")
+
+# %% Data Loading from scanpy
+J = 2000
+dfile = path.join(dpth,"sshippo_J{}.h5ad".format(J))
+ad = read_h5ad(dfile)
+Dtr,Dval = preprocess.anndata_to_train_val(ad,layer="counts",sz="scanpy")
+Dtr_n,Dval_n = preprocess.anndata_to_train_val(ad) #normalized data
+fmeans,Dtr_c,Dval_c = preprocess.center_data(Dtr_n,Dval_n) #centered features
+Xtr = Dtr["X"] #note this should be identical to Dtr_n["X"]
+Ytr = Dtr["Y"]
+Ntr = Xtr.shape[0]
+Dtf = preprocess.prepare_datasets_tf(Dtr,Dval=Dval,shuffle=False)
+Dtf_n = preprocess.prepare_datasets_tf(Dtr_n,Dval=Dval_n,shuffle=False)
+Dtf_c = preprocess.prepare_datasets_tf(Dtr_c,Dval=Dval_c,shuffle=False)
+
+# %% initialize inducing points and tuning parameters
+M = 3000
+# Z = misc.kmeans_inducing_pts(Xtr, 3000)
+# M = Z.shape[0]
+ker = tfk.MaternThreeHalves
+
+#%% NSF Hybrid object
+L = 20
+T = ceil(L/2)
+try:
+  pp = path.join(mpth,"L{}/poi_sz-scanpy/NSFH_T{}_{}_M{}".format(L,T,ker.__name__, M))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  Z = misc.kmeans_inducing_pts(Xtr, M)
+  fit = sfh.ProcessFactorizationHybrid(Ntr, J, L, Z, lik="poi", nonneg=True,
+                                       psd_kernel=ker)
+  fit.elbo_avg(**Dtr)
+  fit.init_loadings(Ytr,X=Xtr,sz=Dtr["sz"],shrinkage=0.3)
+  pp = fit.generate_pickle_path(base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*D['raw']['tf'])
+ttl = "NSFH: spatial, non-negative factors, Poisson likelihood"
+visualize.plot_loss(tro.loss,title=ttl)#,ss=range(200,240))
+
+# %% NSFH: postprocess SPDE style
+hmkw = {"figsize":(6,2.4),"s":0.1,"marker":".","subplot_space":0,
+        "spinecolor":"white"}
+try:
+  insfh = misc.unpickle_from_file(path.join(mpth,"insfh_L20_M3000_spde.pickle"))
+except FileNotFoundError:
+  insfh = postprocess.interpret_nsfh(fit,Xtr,S=10,lda_mode=False)
+  misc.pickle_to_file(insfh,path.join(mpth,"insfh_L20_M3000_spde.pickle"))
+tgnames = [str(i) for i in range(1,T+1)]
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insfh["spatial"]["factors"]),
+                                (2,5), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.03, y=.88, fontsize="small", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"sshippo_heatmap_nsfh20_spde_spat.png"),
+            bbox_inches='tight', dpi=300)
+
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insfh["nonspatial"]["factors"]),
+                                (2,5), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.03, y=.88, fontsize="small", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"sshippo_heatmap_nsfh20_spde_nsp.png"),
+            bbox_inches='tight', dpi=300)
+#%% Top genes for each latent dimension
+W = insfh["spatial"]["loadings"]#*insf["totals"][:,None]
+W[np.isnan(W)] = 0.0
+V = insfh["nonspatial"]["loadings"]
+V[np.isnan(V)] = 0.0
+topgenes = W.argmax(axis=0).tolist()
+tgnames = ad.var.index[topgenes]
+Ytg = Dtr["Y"][:,topgenes]/Dtr["sz"]
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(Ytg), (2,5), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.02, y=.88, fontsize="x-small", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"sshippo_heatmap_nsfh20_spde_spat_genes.png"),
+            bbox_inches='tight', dpi=300)
+#save loadings to disk for further interpretation
+WV = np.hstack((W,V))*insfh["totals"][:,None]
+WVdf=pd.DataFrame(WV, index=ad.var.index, columns=range(1,L+1))
+WVdf.to_csv(path.join(rpth,"sshippo_nsfh20_spde_loadings.csv"))
+#%% spatial importance per gene
+alpha = W.sum(axis=1)
+pd1 = pd.DataFrame({"gene":ad.var_names, "data":"sshippo",
+                    "L":L, "T":T, "spatial_wt":alpha})
+pd1.spatial_wt.hist(bins=100)
+pd1.to_csv(path.join(rpth,"NSFH_spatial_gene_weights_L{}_T{}.csv".format(L,T)),
+           index=False)
+# %% relative importance of each factor
+pd2 = postprocess.nsfh_factor_importance(insfh,lda_mode=False)
+pd2.plot.bar(x="factor_type",y="weight")
+pd2.to_csv(path.join(rpth,"NSFH_dim_weights_spde_L{}_T{}.csv".format(L,T)),
+           index=False)
+#%% Autocorrelation of spatial and nonspatial factors
+Fi,Fac = misc.dims_autocorr(insfh["spatial"]["factors"], Xtr, sort=False)
+Fnames = ["sp"+str(i) for i in range(1,len(Fac)+1)]
+Hi,Hac = misc.dims_autocorr(insfh["nonspatial"]["factors"], Xtr, sort=False)
+Hnames = ["ns"+str(i) for i in range(1,len(Hac)+1)]
+res = pd.DataFrame({"component":Fnames+Hnames,"moran_i":np.concatenate((Fac,Hac))})
+res.plot.bar(x="component",y="moran_i")
+res.to_csv(path.join(rpth,"NSFH_dim_autocorr_spde_L{}_T{}.csv".format(L,T)),
+           index=False)
+#%% Plot genes with low spatial importance (compare to Hotspot)
+genes = ["SST","NPY","GAD2"]
+gid = np.where(ad.var_names.isin(genes))[0]
+Ytg = Dtr["Y"][:,gid]/Dtr["sz"]
+hmkw = {"figsize":(6,2),"s":0.1,"marker":".","subplot_space":0,
+        "spinecolor":"white"}
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(Ytg), (1,3), **hmkw)
+visualize.set_titles(fig, genes, x=0.02, y=.88, fontsize="x-small", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"sshippo_heatmap_nsfh20_spde_least_spatial_genes.pdf"),
+            bbox_inches='tight')#, dpi=300)
+
+# %% NSFH: postprocess LDA style
+insfh = postprocess.interpret_nsfh(fit,Xtr,S=10,lda_mode=True)
+#misc.pickle_to_file(insfh,path.join(mpth,"insfh_L20_M3000_lda.pickle"))
+#insfh = misc.unpickle_from_file(path.join(mpth,"insfh_L20_M3000_lda.pickle"))
+# fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insfh["spatial"]["factors"]),
+#                                 (2,5), **hmkw)
+# fig.savefig(path.join(plt_pth,"sshippo_heatmap_nsfh20_lda_spat.png"),bbox_inches='tight')
+# fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insfh["nonspatial"]["factors"]),
+#                                 (2,5), **hmkw)
+# fig.savefig(path.join(plt_pth,"sshippo_heatmap_nsfh20_lda_nsp.png"),bbox_inches='tight')
+#%% spatial importance per cell
+alpha = insfh["spatial"]["factors"].sum(axis=1)
+pd1 = pd.DataFrame({"data":"sshippo", "L":L, "T":T, "spatial_wt":alpha})
+pd1.spatial_wt.hist(bins=100)
+pd1.to_csv(path.join(rpth,"NSFH_spatial_cell_weights_L{}_T{}.csv".format(L,T)),
+           index=False)
+# %% relative importance of each factor
+pd2 = postprocess.nsfh_factor_importance(insfh,lda_mode=True)
+pd2.plot.bar(x="factor_type",y="weight")
+pd2.to_csv(path.join(rpth,"NSFH_dim_weights_lda_L{}_T{}.csv".format(L,T)),
+           index=False)
+
+#%% PNMF
+L = 20
+try:
+  pp = path.join(mpth,"L{}/poi_sz-scanpy/PNMF".format(L))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  fit = cf.CountFactorization(Ntr, J, L, lik="poi", nonneg=True)
+  fit.elbo_avg(Dtr["Y"],sz=Dtr["sz"],idx=Dtr["idx"])
+  fit.init_loadings(Dtr["Y"],sz=Dtr["sz"])
+  pp = fit.generate_pickle_path("scanpy",base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*Dtf)
+#%% Postprocess
+hmkw = {"figsize":(6,5), "s":0.1, "marker":".", "subplot_space":0,
+        "spinecolor":"white"}
+ipnmf = postprocess.interpret_pnmf(fit,S=10,lda_mode=False)
+tgnames = [str(i) for i in range(1,L+1)]
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(ipnmf["factors"]), (4,5), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.05, y=.85, fontsize="medium", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"sshippo_heatmap_pnmf20.png"),
+            bbox_inches='tight', dpi=300)
+
+#%% Factor Analysis (FA)
+L = 20
+try:
+  pp = path.join(mpth,"L{}/gau/FA".format(L))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  fit = cf.CountFactorization(Ntr, J, L, lik="gau", nonneg=False,
+                              feature_means=fmeans)
+  fit.init_loadings(Dtr_c["Y"])
+  pp = fit.generate_pickle_path(base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*Dtf_c)
+#%% plot posterior mean
+Hplot = misc.t2np(fit.sample_latent_factors(S=10))
+hmkw = {"figsize":(6,5),"s":0.1,"marker":".","subplot_space":0,
+        "spinecolor":"white"}
+fig,axes=visualize.multiheatmap(Xtr, Hplot-Hplot.mean(axis=0), (4,5), **hmkw)
+tgnames = [str(i) for i in range(1,L+1)]
+visualize.set_titles(fig, tgnames, x=0.03, y=.88, fontsize="small", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"sshippo_heatmap_fa20.png"),
+            bbox_inches='tight', dpi=300)
+
+#%% Gaussian RSF
+L = 20
+try:
+  pp = path.join(mpth,"L{}/gau/RSF_{}_M{}".format(L,ker.__name__, M))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  Z = misc.kmeans_inducing_pts(Xtr, M)
+  fit = sf.SpatialFactorization(J,L,Z,psd_kernel=ker,nonneg=False,lik="gau",
+                                feature_means=fmeans)
+  fit.init_loadings(Dtr_c["Y"])
+  pp = fit.generate_pickle_path(base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*Dtf_c)
+#%% plot posterior mean
+try:
+  irsf = misc.unpickle_from_file(path.join(mpth,"irsf_L20_M3000.pickle"))
+except FileNotFoundError:
+  #interactive --mem=72G
+  irsf = {"loadings":fit.W.numpy()}
+  irsf["factors"] = misc.t2np(fit.sample_latent_GP_funcs(Xtr, S=10, chol=False)).T
+  misc.pickle_to_file(irsf,path.join(mpth,"irsf_L20_M3000.pickle"))
+Fplot = irsf["factors"]
+hmkw = {"figsize":(6,5),"s":0.1,"marker":".","subplot_space":0,
+        "spinecolor":"white"}
+fig,axes=visualize.multiheatmap(Xtr, Fplot-Fplot.mean(axis=0), (4,5), **hmkw)
+tgnames = [str(i) for i in range(1,L+1)]
+visualize.set_titles(fig, tgnames, x=0.03, y=.88, fontsize="small", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"sshippo_heatmap_rsf20.png"),
+            bbox_inches='tight', dpi=300)

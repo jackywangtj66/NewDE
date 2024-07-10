@@ -1,0 +1,320 @@
+# -*- coding: utf-8 -*-
+# ---
+# jupyter:
+#   jupytext:
+#     text_representation:
+#       extension: .ipy
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.6.0
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
+
+# %%
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from os import path
+from math import ceil
+from scanpy import read_h5ad
+from tensorflow_probability import math as tm
+tfk = tm.psd_kernels
+
+from models import cf,sf,sfh
+from models.mefisto import MEFISTO
+from utils import preprocess,training,misc,visualize,postprocess
+
+dtp = "float32"
+pth = "scrna/visium_brain_sagittal"
+dpth = path.join(pth,"data")
+mpth = path.join(pth,"models/V5")
+rpth = path.join(pth,"results")
+plt_pth = path.join(rpth,"plots")
+
+# %% Data Loading from scanpy
+J = 2000
+ad = read_h5ad(path.join(dpth,"visium_brain_sagittal_J{}.h5ad".format(J)))#[:,:J]
+#adtr,adval = preprocess.split_anndata(ad)
+#D,fmeans = preprocess.load_data(path.join(dpth,"visium_brain_sagittal_J2000.h5ad"))
+Dtr,Dval = preprocess.anndata_to_train_val(ad,layer="counts",sz="scanpy")
+Dtr_n,Dval_n = preprocess.anndata_to_train_val(ad) #normalized data
+fmeans,Dtr_c,Dval_c = preprocess.center_data(Dtr_n,Dval_n) #centered features
+Xtr = Dtr["X"] #note this should be identical to Dtr_n["X"]
+Ntr = Xtr.shape[0]
+Dtf = preprocess.prepare_datasets_tf(Dtr,Dval=Dval,shuffle=False)
+Dtf_n = preprocess.prepare_datasets_tf(Dtr_n,Dval=Dval_n,shuffle=False)
+Dtf_c = preprocess.prepare_datasets_tf(Dtr_c,Dval=Dval_c,shuffle=False)
+visualize.heatmap(Xtr,Dtr["Y"][:,0],marker="D",s=15)
+
+#%% Visualize raw data
+plt.imshow(np.log1p(Dtr["Y"])[:50,:100],cmap="Blues")
+
+#%% Visualize inducing points
+Z = misc.kmeans_inducing_pts(Xtr,500)
+fig,ax=plt.subplots(figsize=(12,10))
+ax.scatter(Xtr[:,0],Xtr[:,1],marker="D",s=50,)
+ax.scatter(Z[:,0],Z[:,1],c="red",s=30)
+
+# %% initialize inducing points and tuning parameters
+Z = misc.kmeans_inducing_pts(Xtr, 2363)
+M = Z.shape[0]
+ker = tfk.MaternThreeHalves
+S = 3 #samples for elbo approximation
+
+#%% NSF: Spatial only with non-negative factors
+L = 12 #number of latent factors, ideally divisible by 2
+try:
+  pp = path.join(mpth,"L{}/poi_sz-scanpy/NSF_{}_M{}".format(L,ker.__name__,M))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  fit = sf.SpatialFactorization(J,L,Z,psd_kernel=ker,nonneg=True,lik="poi")
+  fit.elbo_avg(Xtr,Dtr["Y"],sz=Dtr["sz"])
+  fit.init_loadings(Dtr["Y"],X=Xtr,sz=Dtr["sz"])
+  fit.elbo_avg(Xtr,Dtr["Y"],sz=Dtr["sz"])
+  pp = fit.generate_pickle_path("scanpy",base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*Dtf)
+ttl = "NSF: spatial, non-negative factors, Poisson likelihood"
+visualize.plot_loss(tro.loss,title=ttl)#,ss=range(2000,4000))
+#dev_nsf=visualize.gof(fit,Dtr,Dval=Dval,title=ttl)
+#%% Postprocessing
+hmkw = {"figsize":(4,4), "s":0.3, "marker":"D", "subplot_space":0,
+        "spinecolor":"white"}
+insf = postprocess.interpret_nsf(fit,Xtr,S=10,lda_mode=False)
+tgnames = [str(i) for i in range(1,L+1)]
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insf["factors"]), (4,3), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.05, y=.85, fontsize="medium", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"vz_brn_heatmap_nsf12.pdf"),bbox_inches='tight')
+#%% Top genes for each latent dimensions
+W = insf["loadings"]#*insf["totals"][:,None]
+topgenes = W.argmax(axis=0).tolist()
+tgnames = ad.var.index[topgenes]
+Ytg = Dtr["Y"][:,topgenes]/Dtr["sz"]
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(Ytg), (4,3), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.05, y=.85, fontsize="medium", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"vz_brn_heatmap_nsf12_genes.pdf"),bbox_inches='tight')
+#save loadings to disk for further interpretation
+Wdf=pd.DataFrame(W*insf["totals"][:,None], index=ad.var.index, columns=range(1,L+1))
+Wdf.to_csv(path.join(rpth,"vz_brn_nsf12_spde_loadings.csv"))
+
+#%% PNMF: Non-spatial, nonnegative
+L = 20
+try:
+  pp = path.join(mpth,"L{}/poi_sz-scanpy/PNMF".format(L))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  fit = cf.CountFactorization(Ntr, J, L, lik="poi", nonneg=True)
+  fit.elbo_avg(Dtr["Y"],sz=Dtr["sz"],idx=Dtr["idx"])
+  fit.init_loadings(Dtr["Y"],sz=Dtr["sz"])
+  pp = fit.generate_pickle_path("scanpy",base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*Dtf)
+ttl = "PNMF: nonspatial, non-negative factors, Poisson likelihood"
+visualize.plot_loss(tro.loss,title=ttl)#,ss=range(2000,4000))
+#dev_pnmf = visualize.gof(fit,Dtr,Dval=Dval,title=ttl)
+#%% Postprocess
+hmkw = {"figsize":(10,8), "s":0.5, "marker":"D", "subplot_space":0,
+        "spinecolor":"white"}
+ipnmf = postprocess.interpret_pnmf(fit,S=10,lda_mode=False)
+tgnames = [str(i) for i in range(1,L+1)]
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(ipnmf["factors"]), (4,5), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.05, y=.85, fontsize="medium", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"vz_brn_heatmap_pnmf20.pdf"),bbox_inches='tight')
+
+#%% NSF Hybrid object
+L = 20 #36 #60
+try:
+  T = ceil(L/2)
+  pp = path.join(mpth,"L{}/poi_sz-scanpy/NSFH_T{}_{}_M{}".format(L,T,ker.__name__, M))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  fit = sfh.SpatialFactorizationHybrid(Ntr, J, L, Z, lik="poi", nonneg=True,
+                                       psd_kernel=ker)
+  fit.elbo_avg(Dtr["X"],Dtr["Y"],Dtr["idx"])
+  fit.init_loadings(Dtr["Y"],X=Dtr["X"])
+  pp = fit.generate_pickle_path("scanpy",base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*Dtf, S=S) #1hr
+ttl = "NSFH: spatial, non-negative factors, Poisson likelihood"
+visualize.plot_loss(tro.loss,title=ttl)#,ss=range(200,240))
+#dev_nsfh =visualize.gof(fit,Dtr,Dval=Dval,title=ttl)
+# %% NSFH: Postprocess SPDE style
+hmkw = {"figsize":(10,4), "s":0.5, "marker":"D", "subplot_space":0,
+        "spinecolor":"white"}
+insfh = postprocess.interpret_nsfh(fit,Xtr,S=10,lda_mode=False)
+tgnames = [str(i) for i in range(1,T+1)]
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insfh["spatial"]["factors"]),
+                                (2,5), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.05, y=.85, fontsize="medium", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"vz_brn_heatmap_nsfh{}_spde_spat.pdf".format(L)),
+            bbox_inches='tight')
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insfh["nonspatial"]["factors"]),
+                                (2,5),**hmkw)
+visualize.set_titles(fig, tgnames, x=0.05, y=.85, fontsize="medium", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"vz_brn_heatmap_nsfh{}_spde_nsp.pdf".format(L)),
+            bbox_inches='tight')
+#%% Top genes for each latent dimension
+W = insfh["spatial"]["loadings"]#*insf["totals"][:,None]
+W[np.isnan(W)] = 0.0
+V = insfh["nonspatial"]["loadings"]
+V[np.isnan(V)] = 0.0
+topgenes = W.argmax(axis=0).tolist()
+tgnames = ad.var.index[topgenes]
+Ytg = Dtr["Y"][:,topgenes]/Dtr["sz"]
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(Ytg), (2,5), **hmkw)
+visualize.set_titles(fig, tgnames, x=0.05, y=.85, fontsize="medium", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,
+                      "vz_brn_heatmap_nsfh{}_spde_spat_genes.pdf".format(L)),
+            bbox_inches='tight')
+#save loadings to disk for further interpretation
+WV = np.hstack((W,V))*insfh["totals"][:,None]
+WVdf=pd.DataFrame(WV, index=ad.var.index, columns=range(1,L+1))
+WVdf.to_csv(path.join(rpth,"vz_brn_nsfh{}_spde_loadings.csv".format(L)))
+#%% spatial importance per gene
+alpha = insfh["spatial"]["loadings"].sum(axis=1)
+pd1 = pd.DataFrame({"gene":ad.var_names, "data":"visium_brain_sagittal",
+                    "L":L, "T":T, "spatial_wt":alpha})
+pd1.to_csv(path.join(rpth,"NSFH_spatial_gene_weights_L{}_T{}.csv".format(L,T)),
+           index=False)
+pd1.spatial_wt.hist(bins=100)
+# %% relative importance of each factor
+pd2 = postprocess.nsfh_factor_importance(insfh,lda_mode=False)
+pd2.plot.bar(x="factor_type",y="weight")
+pd2.to_csv(path.join(rpth,"NSFH_dim_weights_spde_L{}_T{}.csv".format(L,T)),
+           index=False)
+# %% Does implied size factor correspond to real size factor
+plt.scatter(Dtr["Y"].sum(axis=0),insfh["totals"])
+plt.axline((0,0),slope=1,c="black",ls="--",lw=2)
+#%% Autocorrelation of spatial and nonspatial factors
+Fi,Fac = misc.dims_autocorr(insfh["spatial"]["factors"], Xtr, sort=False)
+Fnames = ["sp"+str(i) for i in range(1,len(Fac)+1)]
+Hi,Hac = misc.dims_autocorr(insfh["nonspatial"]["factors"], Xtr, sort=False)
+Hnames = ["ns"+str(i) for i in range(1,len(Hac)+1)]
+res = pd.DataFrame({"component":Fnames+Hnames,"moran_i":np.concatenate((Fac,Hac))})
+res.plot.bar(x="component",y="moran_i")
+res.to_csv(path.join(rpth,"NSFH_dim_autocorr_spde_L{}_T{}.csv".format(L,T)),
+           index=False)
+#%% Plot genes with low spatial importance (compare to Hotspot)
+genes = ["Hba-a1","Hbb-bs"]
+gid = np.where(ad.var_names.isin(genes))[0]
+Ytg = Dtr["Y"][:,gid]/Dtr["sz"]
+hmkw = {"figsize":(6,2), "s":0.5, "marker":"D", "subplot_space":0,
+        "spinecolor":"white"}
+fig,axes=visualize.multiheatmap(Xtr, np.sqrt(Ytg), (1,2), **hmkw)
+visualize.set_titles(fig, genes, x=0.05, y=.85, fontsize="medium", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,
+                      "vz_brn_heatmap_nsfh20_spde_least_spatial_genes.pdf"),
+            bbox_inches='tight')
+
+# %% NSFH: Postprocess LDA style
+insfh = postprocess.interpret_nsfh(fit,Xtr,S=10,lda_mode=True)
+# fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insfh["spatial"]["factors"]),
+#                                 (3,6), **hmkw)
+# fig.savefig(path.join(plt_pth,"vz_brn_heatmap_nsfh36_lda_spat.pdf"),bbox_inches='tight')
+# fig,axes=visualize.multiheatmap(Xtr, np.sqrt(insfh["nonspatial"]["factors"]),
+#                                 (3,6), **hmkw)
+# fig.savefig(path.join(plt_pth,"vz_brn_heatmap_nsfh36_lda_nsp.pdf"),bbox_inches='tight')
+#%% spatial importance per cell
+alpha = insfh["spatial"]["factors"].sum(axis=1)
+pd1 = pd.DataFrame({"data":"visium_brain_sagittal", "L":L, "T":T, "spatial_wt":alpha})
+pd1.spatial_wt.hist(bins=100)
+pd1.to_csv(path.join(rpth,"NSFH_spatial_cell_weights_L{}_T{}.csv".format(L,T)),
+           index=False)
+# %% relative importance of each factor
+pd2 = postprocess.nsfh_factor_importance(insfh,lda_mode=True)
+pd2.plot.bar(x="factor_type",y="weight")
+pd2.to_csv(path.join(rpth,"NSFH_dim_weights_lda_L{}_T{}.csv".format(L,T)),
+           index=False)
+
+#%%Gaussian NSF
+fit = sf.SpatialFactorization(J,L,Z,psd_kernel=ker,nonneg=True,lik="gau")
+fit.init_loadings(Dtr_n["Y"],X=Dtr_n["X"])
+pp = fit.generate_pickle_path(base=mpth)
+tro = training.ModelTrainer(fit,pickle_path=pp)
+%time tro.train_model(*Dtf_n)
+ttl = "NSF: spatial, non-negative factors, Gaussian likelihood"
+visualize.plot_loss(tro.loss,title=ttl)#,ss=range(2000,4000))
+dev_nsfg = visualize.gof(fit,Dtr,Dval=Dval,title=ttl)
+
+#%% Gaussian RSF
+L = 20
+try:
+  pp = path.join(mpth,"L{}/gau/RSF_{}_M{}".format(L,ker.__name__, M))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  Z = misc.kmeans_inducing_pts(Xtr, M)
+  fit = sf.SpatialFactorization(J,L,Z,psd_kernel=ker,nonneg=False,lik="gau",
+                                feature_means=fmeans)
+  fit.init_loadings(Dtr_c["Y"])
+  pp = fit.generate_pickle_path(base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*Dtf_c)
+#%% plot posterior mean
+hmkw = {"figsize":(10,8), "s":0.5, "marker":"D", "subplot_space":0,
+        "spinecolor":"white"}
+irsf = postprocess.interpret_rsf(fit,Xtr,S=10)
+Fplot = irsf["factors"]
+fig,axes=visualize.multiheatmap(Xtr, Fplot-Fplot.mean(axis=0), (4,5), **hmkw)
+tgnames = [str(i) for i in range(1,L+1)]
+visualize.set_titles(fig, tgnames, x=0.03, y=.88, fontsize="small", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"vz_brn_heatmap_rsf{}.pdf".format(L)),
+            bbox_inches='tight')
+
+#%% Factor Analysis (FA)
+L = 20
+try:
+  pp = path.join(mpth,"L{}/gau/FA".format(L))
+  tro = training.ModelTrainer.from_pickle(pp)
+  fit = tro.model
+except FileNotFoundError:
+  fit = cf.CountFactorization(Ntr, J, L, lik="gau", nonneg=False,
+                              feature_means=fmeans)
+  fit.init_loadings(Dtr_c["Y"])
+  pp = fit.generate_pickle_path(base=mpth)
+  tro = training.ModelTrainer(fit,pickle_path=pp)
+  %time tro.train_model(*Dtf_c)
+#%% plot posterior mean
+Hplot = misc.t2np(fit.sample_latent_factors(S=10))
+hmkw = {"figsize":(10,8), "s":0.5, "marker":"D", "subplot_space":0,
+        "spinecolor":"white"}
+fig,axes=visualize.multiheatmap(Xtr, Hplot-Hplot.mean(axis=0), (4,5), **hmkw)
+tgnames = [str(i) for i in range(1,L+1)]
+visualize.set_titles(fig, tgnames, x=0.03, y=.88, fontsize="small", c="white",
+                     ha="left", va="top")
+fig.savefig(path.join(plt_pth,"vz_brn_heatmap_fa{}.pdf".format(L)),
+            bbox_inches='tight')
+
+# %% MEFISTO- Gaussian
+pp = path.join(mpth,"L4/gau/MEFISTO_M1000")
+mef = MEFISTO(Dtr_n, 4, inducing_pts=1000, pickle_path=pp)
+%time mef.train() #also saves to pickle file
+#mef = MEFISTO.from_pickle(pp)
+ttl = "MEFISTO"
+dev_mef = visualize.gof(mef,Dtr,Dval=Dval,title=ttl)
+
+#%% NMF from sklearn
+from sklearn.decomposition import NMF
+fit = NMF(L,beta_loss="kullback-leibler",solver="mu")
+Fhat = fit.fit_transform(Dtr["Y"])
+visualize.multiheatmap(Xtr,Fhat,(3,4),figsize=(7,4),s=1,marker="D",cmap="Blues")
+
+#%% PCA from sklearn
+from sklearn.decomposition import PCA
+fit = PCA(L)
+Fhat = fit.fit_transform(Dtr["Y"])
+visualize.multiheatmap(Xtr,Fhat,(3,4),figsize=(7,4),s=1,marker="D",cmap="RdBu")
