@@ -206,7 +206,8 @@ class MixedGaussian:
             new_mean[:,k:(k+1)] = self.Y @ omega[:,k:(k+1)] / np.sum(omega[:,k])
         new_dev = self.Y[np.newaxis,:] - new_mean.transpose()[:,:,np.newaxis]
         #pi
-        self.pi = np.average(omega,axis=0)
+        if self.update_pi:
+            self.pi = np.average(omega,axis=0)
         
         for k in range(self.K):
             self.cov_new = []
@@ -242,7 +243,8 @@ class MixedGaussian:
             new_mean[:,k:(k+1)] = self.Y @ omega[:,k:(k+1)] / np.sum(omega[:,k])
         new_dev = self.Y[np.newaxis,:] - new_mean.transpose()[:,:,np.newaxis]
         #pi
-        self.pi = np.average(omega,axis=0)
+        if self.update_pi:
+            self.pi = np.average(omega,axis=0)
         return new_mean
     
     def param_init(self):
@@ -251,10 +253,11 @@ class MixedGaussian:
         kmeans = KMeans(n_clusters=self.K, random_state=0).fit(sample.T)
         return kmeans.cluster_centers_.T
 
-    def run_cluster(self,Y,K,pi=None,mean=None,sigma_sq=None,delta=None,iter=500,threshold=5e-2,k_means_init=True):
+    def run_cluster(self,Y,K,pi=None,mean=None,sigma_sq=None,delta=None,iter=500,threshold=5e-2,k_means_init=True,update_pi=True):
         self.Y = Y
         self.K = K
         self.N,self.G = self.Y.shape
+        self.update_pi = update_pi
         if pi is not None:
             self.pi = np.array(pi,dtype=float)
         else:
