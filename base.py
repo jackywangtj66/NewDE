@@ -8,6 +8,7 @@ from operator import itemgetter
 import warnings
 from sklearn.cluster import KMeans
 from scipy.spatial import distance_matrix
+import random
 
 def _pinv_1d(v, eps=1e-5):
     return np.array([0 if abs(x) <= eps else 1/x for x in v], dtype=float)
@@ -28,14 +29,6 @@ class Kernel:
         l: hyperparameter for kernel
         """
         super().__init__()
-        # if mean.ndim == 1:
-        #     self.all_mean = np.array(mean)[:,np.newaxis]
-        # else:
-        #     self.all_mean = np.array(mean)       
-        # if ss_loc is None and dependency is not None:
-        #     warnings.warn('Only')
-        #self.dependency = dependency   # temporarily assuming dependency[i] < i 
-        #self.M = len(dependency)
         self.N = len(spatial)
         #self.all_cov = [[0 for _ in range(self.M)] for _ in range(self.M)]
         #self.ss_loc = ss_loc
@@ -45,6 +38,7 @@ class Kernel:
         self.d = d
         self.A = []
         self.cond_cov = []
+        self.kernel = kernel
         self._initialize(cov,ss_loc,dependency,group_size)
     
     def get_mat(self,rows,cols):
@@ -118,12 +112,18 @@ class Kernel:
             if cov is not None:
                 self.all_cov[i][i] = cov[np.ix_(self.ss_loc[i],self.ss_loc[i])]
             else:
-                self.all_cov[i][i] = rbf_kernel(self.spatial[self.ss_loc[i]],gamma=self.l)
+                if self.kernel == 'rbf':
+                    self.all_cov[i][i] = rbf_kernel(self.spatial[self.ss_loc[i]],gamma=self.l)
+                else:
+                    self.all_cov[i][i] = laplacian_kernel(self.spatial[self.ss_loc[i]],gamma=self.l)
             for j in self.dependency[i]:
                 if cov is not None:
                     self.all_cov[i][j] = cov[np.ix_(self.ss_loc[i],self.ss_loc[j])]
                 else:
-                    self.all_cov[i][j] = rbf_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
+                    if self.kernel == 'rbf':
+                        self.all_cov[i][j] = rbf_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
+                    else:
+                        self.all_cov[i][j] = laplacian_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
         for k in range(self.M):
             for i in self.dependency[k]:
                 for j in self.dependency[k]:
@@ -131,7 +131,10 @@ class Kernel:
                         if cov is not None:
                             self.all_cov[i][j] = cov[np.ix_(self.ss_loc[i],self.ss_loc[j])]
                         else:
-                            self.all_cov[i][j] = rbf_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
+                            if self.kernel == 'rbf':
+                                self.all_cov[i][j] = rbf_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
+                            else:
+                                self.all_cov[i][j] = laplacian_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
     
 
     def _init_ds_eig(self):
@@ -170,13 +173,8 @@ class Kernel:
         return cond_cov_eig
 
 class MixedGaussian:
-    def __init__(self,spatial,ss_loc=None,group_size=16,cov=None,dependency=None,d=5,kernel='laplacian',l=0.01):
+    def __init__(self,spatial,ss_loc=None,group_size=16,cov=None,dependency=None,d=5,kernel='rbf',l=0.01):
         self.kernel = Kernel(spatial,ss_loc,group_size,cov,dependency,d,kernel,l)
-        # self.pi = [1/self.K]*K
-        # self.mean = [np.repeat(0,self.kernel.N)[:,np.newaxis]]*K
-        # self.delta = [1]*K
-        # self.sigma_sq = [1]*K
-
 
     def update_cond_mean(self):
         #Y:N*G  mean:N*K
@@ -226,15 +224,34 @@ class MixedGaussian:
                 #t_1 += np.trace(self.kernel.all_cov[i][i])
                 t_2 += np.trace(self.cov_new[i])
             #print(numer,denom,t_1,t_2)
-            self.sigma_sq[k] = (numer - self.t_1*t_2/self.N) / (self.denom - self.t_1**2/self.N)
+            self.sigma_sq[k] = (numer - self.t_1*t_2/self.N)*0.5 / (self.denom - self.t_1**2/self.N) + self.sigma_sq[k]/2
             #print(self.sigma_sq[k],(numer - t_1*t_2/self.N) / (denom - t_1**2/self.N))
-            self.delta[k] = (t_2-self.sigma_sq[k]*self.t_1)/(self.N*self.sigma_sq[k])
+            if self.sigma_sq[k] == 0:
+                self.delta[k] = t_2*0.5/self.N + self.delta[k]/2
+            else:
+                self.delta[k] = (t_2-self.sigma_sq[k]*self.t_1)*0.5/(self.N*self.sigma_sq[k]) + self.delta[k]/2
             if self.delta[k]<=0:
                 self.delta[k] = 0 
                 self.sigma_sq[k] = numer / self.denom 
         return new_mean
+    
+    def update_mean(self,omega):
+        new_mean= np.zeros_like(self.mean)
+        #mean
+        for k in range(self.K):
+            new_mean[:,k:(k+1)] = self.Y @ omega[:,k:(k+1)] / np.sum(omega[:,k])
+        new_dev = self.Y[np.newaxis,:] - new_mean.transpose()[:,:,np.newaxis]
+        #pi
+        self.pi = np.average(omega,axis=0)
+        return new_mean
+    
+    def param_init(self):
+        samp_ind = random.sample(range(self.G),self.G//10)
+        sample = self.Y[:,samp_ind]
+        kmeans = KMeans(n_clusters=self.K, random_state=0).fit(sample.T)
+        return kmeans.cluster_centers_.T
 
-    def run_cluster(self,Y,K,pi=None,mean=None,sigma_sq=None,delta=None,iter=500):
+    def run_cluster(self,Y,K,pi=None,mean=None,sigma_sq=None,delta=None,iter=500,threshold=5e-2,k_means_init=True):
         self.Y = Y
         self.K = K
         self.N,self.G = self.Y.shape
@@ -248,6 +265,11 @@ class MixedGaussian:
         else:    
             #self.mean = np.abs(np.random.normal(size=(self.N, self.K)))
             self.mean = np.random.uniform(size=(self.N, self.K))
+            if k_means_init:
+                self.init_mean = self.param_init()
+                self.mean = self.init_mean
+            
+        #return self.mean
         if sigma_sq is not None:
             self.sigma_sq = np.array(sigma_sq,dtype=float)
         else:
@@ -255,7 +277,7 @@ class MixedGaussian:
         if delta is not None:
             self.delta = np.array(delta,dtype=float)
         else:
-            self.delta = np.ones(self.K,dtype=float)*0.1
+            self.delta = np.ones(self.K,dtype=float)*1
         
         # power = np.zeros((G,self.K))
         self.omega = np.ones((self.G,self.K))/self.K
@@ -268,20 +290,10 @@ class MixedGaussian:
             self.t_1 += np.trace(self.kernel.all_cov[i][i])
         
         while not converge:
+            print('{}:updating cond_cov'.format(count))
             cond_cov_eig = self.kernel.update_cond_cov(self.delta)
             self.update_cond_mean()
 
-            #compute loglikelihood
-            # for k in range(self.K):
-            #     self.ll[:,k] = np.log(2 * np.pi)*self.N + 2*np.log(self.sigma_sq[k])*self.N
-            #     for i in range(self.kernel.M):
-            #         det = np.prod(cond_cov_eig[k][i][0])
-            #         if det <= 0:
-            #             print(cond_cov_eig[k][i][0]) 
-            #         self.ll[:,k] += np.log(det)
-            #         temp = self.cond_dev[k][self.kernel.ss_loc[i],:].T @ cond_cov_eig[k][i][1]
-            #         self.ll[:,k] += np.sum(np.multiply(1/cond_cov_eig[k][i][0],np.square(temp)),axis=1)/self.sigma_sq[k]
-            # self.ll = self.ll*-0.5
             ll = self.compute_ll(cond_cov_eig)
             #print(self.ll)
             #print(compute_likelihood(self.Y,self.kernel,self.cond_dev[0],self.sigma_sq[0],cond_cov_eig[0]))
@@ -291,12 +303,47 @@ class MixedGaussian:
                 else:
                     for g in range(self.G):
                         #omega[g,k] = 3/4*self.pi[k]/np.sum(self.pi * _pexp((self.ll[g]-self.ll[g][k])/np.sqrt(self.N))) + omega[g,k]/4
-                        self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((ll[g]-ll[g][k])/np.sqrt(self.N)))
-            new_mean = self.update_param(self.omega)
+                        self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((ll[g]-ll[g][k])/np.sqrt(self.N))) + 1e-3/self.G
+                        if np.sum(self.pi * _pexp((ll[g]-ll[g][k])/np.sqrt(self.N))) == 0:
+                            print(ll[g],ll[g][k])
+
+            #print(self.omega)
+            new_mean = self.update_mean(self.omega)
+            #print(self.delta,self.sigma_sq)
             count += 1
-            if count > iter or np.mean(np.abs(new_mean-self.mean))<0.003:
+            if count > iter or np.mean(np.abs(new_mean-self.mean))<0.3:
                 converge = True
             self.mean = new_mean
+            #print(self.pi,self.sigma_sq,self.delta)
             #indexes = np.array([np.arange(0,2),np.arange(300,302),np.arange(800,802)])
             #print(self.sigma_sq,self.delta,self.pi,omega[indexes])
-        return np.argmax(self.omega,axis=1)
+        
+        print('updating variance')
+        converge = False
+        while not converge:
+            print('{}:updating cond_cov'.format(count))
+            cond_cov_eig = self.kernel.update_cond_cov(self.delta)
+            self.update_cond_mean()
+
+            ll = self.compute_ll(cond_cov_eig)
+            #print(self.ll)
+            #print(compute_likelihood(self.Y,self.kernel,self.cond_dev[0],self.sigma_sq[0],cond_cov_eig[0]))
+            for k in range(self.K):
+                if self.pi[k] == 0:
+                    self.omega[:,k] = 0
+                else:
+                    for g in range(self.G):
+                        #omega[g,k] = 3/4*self.pi[k]/np.sum(self.pi * _pexp((self.ll[g]-self.ll[g][k])/np.sqrt(self.N))) + omega[g,k]/4
+                        self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((ll[g]-ll[g][k]))) + 1e-3/self.G
+                        if np.sum(self.pi * _pexp((ll[g]-ll[g][k]))) == 0:
+                            print(ll[g],ll[g][k])
+
+            #print(self.omega)
+            new_mean = self.update_param(self.omega)
+            #print(self.delta,self.sigma_sq)
+            count += 1
+            if count > iter or np.mean(np.abs(new_mean-self.mean))<threshold:
+                converge = True
+            self.mean = new_mean
+            #print(self.pi,self.sigma_sq,self.delta)
+        return self.mean
