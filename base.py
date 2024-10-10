@@ -121,9 +121,11 @@ class Kernel:
                     self.all_cov[i][j] = cov[np.ix_(self.ss_loc[i],self.ss_loc[j])]
                 else:
                     if self.kernel == 'rbf':
-                        self.all_cov[i][j] = rbf_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
+                        self.all_cov[i][j] = rbf_kernel(self.spatial[self.ss_loc[i]],
+                                                        self.spatial[self.ss_loc[j]],gamma=self.l)
                     else:
-                        self.all_cov[i][j] = laplacian_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
+                        self.all_cov[i][j] = laplacian_kernel(self.spatial[self.ss_loc[i]],
+                                                              self.spatial[self.ss_loc[j]],gamma=self.l)
         for k in range(self.M):
             for i in self.dependency[k]:
                 for j in self.dependency[k]:
@@ -132,9 +134,11 @@ class Kernel:
                             self.all_cov[i][j] = cov[np.ix_(self.ss_loc[i],self.ss_loc[j])]
                         else:
                             if self.kernel == 'rbf':
-                                self.all_cov[i][j] = rbf_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
+                                self.all_cov[i][j] = rbf_kernel(self.spatial[self.ss_loc[i]],
+                                                                self.spatial[self.ss_loc[j]],gamma=self.l)
                             else:
-                                self.all_cov[i][j] = laplacian_kernel(self.spatial[self.ss_loc[i]],self.spatial[self.ss_loc[j]],gamma=self.l)
+                                self.all_cov[i][j] = laplacian_kernel(self.spatial[self.ss_loc[i]],
+                                                                      self.spatial[self.ss_loc[j]],gamma=self.l)
     
 
     def _init_ds_eig(self):
@@ -168,7 +172,8 @@ class Kernel:
                 #self.cond_cov.append(self.kernel.base_cond_cov[i]+self.delta*np.eye(len(self.kernel.ss_loc[i])))
                     s,u = np.linalg.eigh(self.cond_cov[i]+delta*np.eye(len(self.ss_loc[i])))
                 else:
-                    s,u = np.linalg.eigh(self.cond_cov[i]+delta*np.eye(len(self.ss_loc[i]))+delta*np.multiply(1/((self.ds_eig[i][0]+delta)*self.ds_eig[i][0]),self.A[i])@self.A[i].T)
+                    s,u = np.linalg.eigh(self.cond_cov[i]+delta*np.eye(len(self.ss_loc[i]))+
+                                         delta*np.multiply(1/((self.ds_eig[i][0]+delta)*self.ds_eig[i][0]),self.A[i])@self.A[i].T)
                 eig.append((s,u))
         return cond_cov_eig
 
@@ -183,7 +188,8 @@ class MixedGaussian:
         for i in range(self.kernel.M):
                 if len(self.kernel.dependency[i]) > 0:
                     for k in range(self.K):
-                        self.cond_dev[k,self.kernel.ss_loc[i],:] = self.cond_dev[k,self.kernel.ss_loc[i],:] - np.multiply(1/(self.kernel.ds_eig[i][0]+self.delta[k]),self.kernel.A[i]) @ self.kernel.ds_eig[i][1].T @ dev[k,self.kernel.ds_loc[i],:]
+                        self.cond_dev[k,self.kernel.ss_loc[i],:] = self.cond_dev[k,self.kernel.ss_loc[i],:] - \
+                        np.multiply(1/(self.kernel.ds_eig[i][0]+self.delta[k]),self.kernel.A[i]) @ self.kernel.ds_eig[i][1].T @ dev[k,self.kernel.ds_loc[i],:]
 
     def compute_ll(self,cond_cov_eig):
         ll = np.zeros((self.G,self.K))
@@ -293,7 +299,7 @@ class MixedGaussian:
             self.t_1 += np.trace(self.kernel.all_cov[i][i])
         
         while not converge:
-            print('{}:updating cond_cov'.format(count))
+            print('Iteration {}'.format(count))
             cond_cov_eig = self.kernel.update_cond_cov(self.delta)
             self.update_cond_mean()
 
@@ -307,8 +313,8 @@ class MixedGaussian:
                     for g in range(self.G):
                         #omega[g,k] = 3/4*self.pi[k]/np.sum(self.pi * _pexp((self.ll[g]-self.ll[g][k])/np.sqrt(self.N))) + omega[g,k]/4
                         self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((ll[g]-ll[g][k])/np.sqrt(self.N))) + 1e-3/self.G
-                        if np.sum(self.pi * _pexp((ll[g]-ll[g][k])/np.sqrt(self.N))) == 0:
-                            print(ll[g],ll[g][k])
+                        # if np.sum(self.pi * _pexp((ll[g]-ll[g][k])/np.sqrt(self.N))) == 0:
+                        #     print(ll[g],ll[g][k])
 
             #print(self.omega)
             new_mean = self.update_mean(self.omega)
@@ -324,7 +330,7 @@ class MixedGaussian:
         print('updating variance')
         converge = False
         while not converge:
-            print('{}:updating cond_cov'.format(count))
+            print('Iteration {}'.format(count))
             cond_cov_eig = self.kernel.update_cond_cov(self.delta)
             self.update_cond_mean()
 
@@ -338,8 +344,8 @@ class MixedGaussian:
                     for g in range(self.G):
                         #omega[g,k] = 3/4*self.pi[k]/np.sum(self.pi * _pexp((self.ll[g]-self.ll[g][k])/np.sqrt(self.N))) + omega[g,k]/4
                         self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((ll[g]-ll[g][k]))) + 1e-3/self.G
-                        if np.sum(self.pi * _pexp((ll[g]-ll[g][k]))) == 0:
-                            print(ll[g],ll[g][k])
+                        # if np.sum(self.pi * _pexp((ll[g]-ll[g][k]))) == 0:
+                        #     print(ll[g],ll[g][k])
 
             #print(self.omega)
             new_mean = self.update_param(self.omega)
