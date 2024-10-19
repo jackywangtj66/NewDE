@@ -259,7 +259,7 @@ class MixedGaussian:
         kmeans = KMeans(n_clusters=self.K, random_state=0).fit(sample.T)
         return kmeans.cluster_centers_.T
 
-    def run_cluster(self,Y,K,pi=None,mean=None,sigma_sq=None,delta=None,iter=500,threshold=5e-2,init_method='k_means',update_pi=True):
+    def run_cluster(self,Y,K,pi=None,mean=None,sigma_sq=None,delta=None,iter=500,threshold=5e-2,init_mean='k_means',update_pi=True):
         self.Y = Y
         self.K = K
         self.N,self.G = self.Y.shape
@@ -274,11 +274,13 @@ class MixedGaussian:
         else:    
             #self.mean = np.abs(np.random.normal(size=(self.N, self.K)))
             self.mean = np.random.uniform(size=(self.N, self.K))
-            if init_method=='k_means':
+            if init_mean == 'k_means':
                 self.init_mean = self.param_init()
                 self.mean = self.init_mean
-            elif init_method == 'sample':
+            elif init_mean == 'sample':
                 self.init_mean = self.Y[:,np.random.choice(self.G,self.K)]
+            elif isinstance(init_mean,np.ndarray):
+                self.init_mean = init_mean
             
         #return self.mean
         if sigma_sq is not None:
@@ -360,3 +362,9 @@ class MixedGaussian:
             #print(self.pi,self.sigma_sq,self.delta)
         self.labels = np.argmax(self.omega,axis=1)    
         return self.mean
+
+    def cluster_counts(self,query_label=None):
+        if query_label is not None:
+            return np.sum(self.labels==query_label)
+        else:
+            return np.array([np.sum(self.labels==i) for i in range(self.K)])
