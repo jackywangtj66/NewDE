@@ -259,7 +259,7 @@ class MixedGaussian:
         kmeans = KMeans(n_clusters=self.K, random_state=0).fit(sample.T)
         return kmeans.cluster_centers_.T
 
-    def run_cluster(self,Y,K,pi=None,mean=None,sigma_sq=None,delta=None,iter=500,threshold=5e-2,k_means_init=True,update_pi=True):
+    def run_cluster(self,Y,K,pi=None,mean=None,sigma_sq=None,delta=None,iter=500,threshold=5e-2,init_method='k_means',update_pi=True):
         self.Y = Y
         self.K = K
         self.N,self.G = self.Y.shape
@@ -274,9 +274,11 @@ class MixedGaussian:
         else:    
             #self.mean = np.abs(np.random.normal(size=(self.N, self.K)))
             self.mean = np.random.uniform(size=(self.N, self.K))
-            if k_means_init:
+            if init_method=='k_means':
                 self.init_mean = self.param_init()
                 self.mean = self.init_mean
+            elif init_method == 'sample':
+                self.init_mean = self.Y[:,np.random.choice(self.G,self.K)]
             
         #return self.mean
         if sigma_sq is not None:
@@ -303,7 +305,7 @@ class MixedGaussian:
             cond_cov_eig = self.kernel.update_cond_cov(self.delta)
             self.update_cond_mean()
 
-            ll = self.compute_ll(cond_cov_eig)
+            self.ll = self.compute_ll(cond_cov_eig)
             #print(self.ll)
             #print(compute_likelihood(self.Y,self.kernel,self.cond_dev[0],self.sigma_sq[0],cond_cov_eig[0]))
             for k in range(self.K):
@@ -312,7 +314,7 @@ class MixedGaussian:
                 else:
                     for g in range(self.G):
                         #omega[g,k] = 3/4*self.pi[k]/np.sum(self.pi * _pexp((self.ll[g]-self.ll[g][k])/np.sqrt(self.N))) + omega[g,k]/4
-                        self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((ll[g]-ll[g][k])/np.sqrt(self.N))) + 1e-3/self.G
+                        self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((self.ll[g]-self.ll[g][k])/np.sqrt(self.N))) + 1e-3/self.G
                         # if np.sum(self.pi * _pexp((ll[g]-ll[g][k])/np.sqrt(self.N))) == 0:
                         #     print(ll[g],ll[g][k])
 
@@ -320,13 +322,14 @@ class MixedGaussian:
             new_mean = self.update_mean(self.omega)
             #print(self.delta,self.sigma_sq)
             count += 1
-            if count > iter or np.mean(np.abs(new_mean-self.mean))<0.3:
+            if count > iter or np.mean(np.abs(new_mean-self.mean))<0.1:
                 converge = True
             self.mean = new_mean
+            #converge = True
             #print(self.pi,self.sigma_sq,self.delta)
             #indexes = np.array([np.arange(0,2),np.arange(300,302),np.arange(800,802)])
             #print(self.sigma_sq,self.delta,self.pi,omega[indexes])
-        
+        #return self.mean
         print('updating variance')
         converge = False
         while not converge:
@@ -334,7 +337,7 @@ class MixedGaussian:
             cond_cov_eig = self.kernel.update_cond_cov(self.delta)
             self.update_cond_mean()
 
-            ll = self.compute_ll(cond_cov_eig)
+            self.ll = self.compute_ll(cond_cov_eig)
             #print(self.ll)
             #print(compute_likelihood(self.Y,self.kernel,self.cond_dev[0],self.sigma_sq[0],cond_cov_eig[0]))
             for k in range(self.K):
@@ -343,7 +346,7 @@ class MixedGaussian:
                 else:
                     for g in range(self.G):
                         #omega[g,k] = 3/4*self.pi[k]/np.sum(self.pi * _pexp((self.ll[g]-self.ll[g][k])/np.sqrt(self.N))) + omega[g,k]/4
-                        self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((ll[g]-ll[g][k]))) + 1e-3/self.G
+                        self.omega[g,k] = self.pi[k]/np.sum(self.pi * _pexp((self.ll[g]-self.ll[g][k]))) + 1e-3/self.G
                         # if np.sum(self.pi * _pexp((ll[g]-ll[g][k]))) == 0:
                         #     print(ll[g],ll[g][k])
 
@@ -355,4 +358,5 @@ class MixedGaussian:
                 converge = True
             self.mean = new_mean
             #print(self.pi,self.sigma_sq,self.delta)
+        self.labels = np.argmax(self.omega,axis=1)    
         return self.mean
