@@ -1,10 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from base import MixedGaussian
+from SparseAEH.base import MixedGaussian
 
-def plot_clusters(gaussian:MixedGaussian,label='counts',s=15):
-    plt.figure(figsize=(18,16))
+def plot_clusters(gaussian:MixedGaussian,label='counts',figsize=(18,16),s=15):
+    plt.figure(figsize=figsize)
     k = gaussian.K
     h = np.ceil(np.sqrt(k)).astype(int)
     w = np.ceil(k/h).astype(int)
